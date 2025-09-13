@@ -1,61 +1,126 @@
-# **Nova Client** Lite
-Feature-rich client for Kour.io that enhances gameplay experience with quality of life improvements and visual enhancements.
+# Nova Client Lite
+Developer‑focused overlay and quality‑of‑life toolkit for Kour.io.
 
-## 🎮 About
-Nova Client is a minimal, developer-style Tampermonkey userscript for Kour.io that provides a clean, professional interface with a focus on functionality and aesthetics.
+Nova Client Lite is a minimal Tampermonkey/Violentmonkey userscript that adds a clean panel, in‑game overlays, and an extensible feature system. It favors stability and performance with defensive error handling and unobtrusive UI.
 
-## ✨ Features
-- **Minimal UI**: Clean, grayscale design with developer aesthetics
-- **Monospace Typography**: Professional code-style fonts
-- **Draggable Interface**: Move the client UI anywhere on screen
-- **Keyboard Shortcuts**: Press F1 to toggle the interface
-- **Game Detection**: Automatically detects when Kour.io is loaded
-- **Status Monitoring**: Real-time client and game status display
+## Highlights
+- Panel UI with tabs and settings; draggable with position persistence
+- Chat overlay with input focus (Enter/Escape) and Unity color markup
+- Always‑on leaderboard overlay (top players by score)
+- Hotkey to toggle panel: `Right Shift` (`ShiftRight`)
+- Lightweight notification toasts (info/success/error)
+- WebGL hook framework for feature‑scoped instrumentation
+- Input unblocking so panel text fields and buttons work reliably
+- Gentle ad cleanup for known placements
 
-## 🚀 Installation
+### Built‑in Features
+- Profile: Hide Name — rotates your visible nickname safely
+- Profile: Give KP — calls in‑game shop panel to grant KP (for testing)
+- Gameplay: ESP — raise player meshes in depth to keep them visible
+- Gameplay: Cycle Classes — cycle through chosen classes via a key
+- Gameplay: Rapid RPG (experimental) — increases reload cadence via switching
+- Chicken: Spawner — spawn a flock for fun testing
+- Chicken: Hide/ESP — hide chickens or render them on top via shader tweak
+- Trolling: Send to Sky — nudge everyone upward (testing playground)
+- Trolling: Nuke All Players — apply a disruptive action to all players
 
-### Prerequisites
-- [Tampermonkey](https://www.tampermonkey.net/) browser extension
+Notes
+- Some items are experimental/testing utilities. Use responsibly and at your own risk.
+- Certain features are mutually exclusive (e.g., `Cycle Classes` vs `Rapid RPG`, `Chicken ESP` vs `Hide Chickens`). The UI prevents conflicts when possible.
 
-### Steps
-1. Install Tampermonkey from your browser's extension store
-2. Click the Tampermonkey icon and select "Create a new script"
-3. Delete the default content and paste the contents of `nova-client.user.js`
-4. Save the script (Ctrl+S)
-5. Navigate to [Kour.io](https://kour.io)
-6. The Nova Client will automatically load and display a "NOVA" button in the top-right corner
+## Installation
+Prerequisite: install the Tampermonkey or Violentmonkey browser extension.
 
-## 🎯 Usage
-- **Toggle UI**: Press `F1` or click the "NOVA" button
-- **Move UI**: Click and drag the header to reposition
-- **Reload**: Use the "Reload Client" button to restart the client
+Manual install
+1. Open Tampermonkey → Create a new script
+2. Replace the template with the contents of `nova-client.user.js`
+3. Save the script
+4. Visit `https://kour.io/`
+5. Nova loads automatically at `document-start`
 
-## 🎨 Design Philosophy
-- **Minimal**: Clean, uncluttered interface
-- **Developer-Friendly**: Monospace fonts and grayscale color scheme
-- **Functional**: Focus on utility over flashy effects
-- **Professional**: Suitable for serious gaming sessions
+Why it works
+- The userscript includes `@match https://kour.io/*` (and subdomains) and a `@require` to Unity Web Modkit so WebGL hooks are available early.
 
-## 🔧 Technical Details
-- **Language**: Vanilla JavaScript (ES6+)
-- **Compatibility**: Modern browsers with Tampermonkey
-- **Performance**: Lightweight with minimal impact on game performance
-- **Architecture**: Modular class-based design for easy extension
+## Usage
+- Toggle panel: press `Right Shift`
+- Drag to move: grab the panel header; position persists per session
+- Chat overlay: `Enter` to focus, `Escape` to unfocus; colors match in‑game
+- Leaderboard/chat: only visible while a map is active (pointer‑lock)
 
-## 📝 Version History
-- **v1.0.0**: Initial release with base UI and core functionality
+## Configuration
+Edit `NovaConfig` inside `nova-client.user.js` to adjust look & behavior:
 
-## 🤝 Contributing
-This is a lite version of Nova Client. Future versions may include additional features such as:
-- Performance overlays
-- Game statistics
-- Custom keybindings
-- Visual enhancements
-- Quality of life improvements
+- Version/name: surfaced in the panel header
+- Theme: `background`, `accent`, `title`, `text`, `border`, `success`, `error`, `purple`, `orange`, `yellow`, `blue`
+- Fonts: `fonts.primary` (defaults to IBM Plex Mono)
+- Hotkeys: `hotkeys.toggleUI` → `{ code: 'ShiftRight', label: 'Right Shift' }`
 
-## 📄 License
-This project is open source and available under the MIT License.
+## Developer API
+Nova exposes a small API at `window.NovaAPI` for registering features, showing notifications, and hooking WebGL. See inline JSDoc in `nova-client.user.js` for full details.
+
+Register a feature (toggle)
+```
+NovaAPI.registerFeature({
+  id: 'demo.feature',
+  name: 'Demo Feature',
+  tab: 'general',
+  onEnable: () => { NovaAPI.success('Demo on'); return true; },
+  onDisable: () => { NovaAPI.info('Demo off'); }
+});
+```
+
+Register a feature group with controls
+```
+NovaAPI.registerFeature({
+  id: 'demo.group',
+  name: 'Demo Group',
+  tab: 'general',
+  type: 'group',
+  mainControlId: 'run',
+  controls: [
+    { id: 'run', type: 'button', label: 'Run', onClick: (ctx) => {/* ... */} },
+    { id: 'count', type: 'number', label: 'Count', defaultValue: 10 }
+  ]
+});
+```
+
+Hook WebGL (feature‑scoped)
+```
+NovaAPI.webgl.install();
+NovaAPI.webgl.register('demo.feature', 'drawElements', ({ gl, args, method }) => {
+  // observe or modify; return { args } to replace, { skipOriginal: true } to drop
+});
+```
+
+Notifications
+```
+NovaAPI.notify('Hello');
+NovaAPI.success('Saved');
+NovaAPI.error({ message: 'Oops', durationMs: 8000 });
+```
+
+## Troubleshooting
+- Script doesn’t load: ensure the userscript is enabled and that `@match` covers `https://kour.io/*` and `https://*.kour.io/*`.
+- Nothing happens on `Right Shift`: verify your keyboard sends `ShiftRight` (some layouts swap keys). Update `NovaConfig.hotkeys.toggleUI.code` if needed.
+- WebGL features not working: check that Unity Web Modkit loaded (Network tab should show the `@require` URL fetched). Some security extensions can block cross‑origin `@require`.
+- UI clicks don’t register: Nova unblocks events inside the panel, but other overlays/extensions can interfere. Temporarily disable conflicts.
+- Experimental features: ESP/Hide/Send/Nuke are best‑effort and may break with game updates.
+
+## Extras
+- WebSocket logger: `ws-logger.user.js` logs send/receive frames and highlights likely chat frames to the DevTools console; useful for reverse‑engineering.
+
+## Technical Notes
+- Plain JavaScript (ES6+); no build step
+- Runs at `document-start`; Unity Web Modkit is pulled via `@require`
+- Modular architecture (UI, registry, hooks, interop) with defensive error handling
+
+## Roadmap
+- Optional performance overlays and instrumentation
+- Additional feature presets and UI polish
+
+## License
+MIT
 
 ---
 
-**Note**: This client is designed for educational and enhancement purposes. Please respect the game's terms of service and use responsibly.
+Nova Client is intended for educational and enhancement purposes. Use responsibly and respect Kour.io’s terms of service.

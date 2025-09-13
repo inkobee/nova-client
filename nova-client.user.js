@@ -18,6 +18,39 @@
 // - Adds a small feature system to toggle enhancements at runtime
 // - Provides helper modules for DOM, storage, WebGL hooks, Firebase, and Unity messaging
 //
+// Quick Start
+// - Install in Tampermonkey/Violentmonkey and visit kour.io
+// - Press Right Shift (`ShiftRight`) to toggle the Nova panel
+// - Use the Features tab to enable/disable built-in tools
+// - Chat overlay: press Enter to focus, Escape to unfocus
+// - Leaderboard and chat show only while a map is playing
+//
+// Public API (window.NovaAPI)
+// - registerFeature(def): Register a feature shown in the panel
+// - setFeatureEnabled(id, enabled): Toggle and persist
+// - isFeatureEnabled(id): Check persisted/active state
+// - listFeatures(): Return shallow copy of registered features
+// - renderFeatures([tab]): Ask UI to re-render (optional tab filter)
+// - webgl.install(): Install WebGL hooks (idempotent)
+// - webgl.register(featureId, method, handler): Hook GL method
+// - webgl.unregister(featureId, method): Remove a hook
+// - notify/info/success/error(messageOrOpts[, durationMs]): Toasts
+//
+// Example: Register a simple feature
+// NovaAPI.registerFeature({
+//   id: 'demo.feature',
+//   name: 'Demo Feature',
+//   tab: 'general',
+//   onEnable: () => { NovaAPI.success('Demo on'); },
+//   onDisable: () => { NovaAPI.info('Demo off'); }
+// });
+// // Persisted state is restored on refresh; use setFeatureEnabled to toggle:
+// // NovaAPI.setFeatureEnabled('demo.feature', true)
+//
+// Hotkeys
+// - Toggle UI: Right Shift (configurable in NovaConfig.hotkeys)
+// - Optional feature-specific hotkeys are declared in their settings
+//
 // Architecture
 // - Logger: consistent logging utilities
 // - ChatUIModule: in-page chat overlay with input and history
@@ -34,8 +67,49 @@
 // - All try/catch blocks swallow errors intentionally to preserve game perf
 // - Use `NovaAPI` for external feature registration and notifications
 
+
 (function() {
     'use strict';
+
+    /**
+     * @typedef {Object} FeatureDefinition
+     * @property {string} id Unique identifier (stable across sessions)
+     * @property {string} name Human‑readable label for the UI
+     * @property {string} [tab] Tab/category id (e.g. 'general', 'visual', 'gameplay')
+     * @property {string[]} [incompatibleWith] Other feature ids to auto‑disable when enabling this feature
+     * @property {() => (boolean|void|Promise<boolean|void>)} [onEnable] Return false to signal retry later
+     * @property {() => (void|Promise<void>)} [onDisable]
+     */
+
+    /**
+     * @typedef {Object} WebGLHookArgs
+     * @property {Function} target Original WebGL method
+     * @property {WebGLRenderingContext|WebGL2RenderingContext} gl GL context (`this`)
+     * @property {any[]} args Current argument list (may be replaced via return value)
+     * @property {string} method Method name (e.g. 'drawElements')
+     * @property {typeof Reflect} Reflect Native Reflect API for safe apply
+     */
+
+    /**
+     * @typedef {Object} ToastOptions
+     * @property {string} message Text to display
+     * @property {'info'|'success'|'error'} [type] Visual style
+     * @property {number} [durationMs] Auto‑dismiss time in ms
+     */
+
+    /**
+     * @typedef {Object} NovaAPI
+     * @property {(def: FeatureDefinition) => void} registerFeature Register a new feature
+     * @property {(id: string, enabled: boolean) => Promise<void>} setFeatureEnabled Toggle and persist
+     * @property {(id: string) => boolean} isFeatureEnabled Query current state
+     * @property {() => FeatureDefinition[]} listFeatures List registered feature definitions
+     * @property {(tab?: string) => void} renderFeatures Force UI to re‑render
+     * @property {{install: () => void, register: (featureId: string, method: string, handler: (args: WebGLHookArgs) => void|{args?: any[], skip?: boolean}) => void, unregister: (featureId: string, method: string) => void}} webgl WebGL hooks
+     * @property {(msg: string|ToastOptions, type?: 'info'|'success'|'error', durationMs?: number) => void} notify Show a toast
+     * @property {(msg: string, durationMs?: number) => void} info Info toast
+     * @property {(msg: string, durationMs?: number) => void} success Success toast
+     * @property {(msg: string, durationMs?: number) => void} error Error toast
+     */
 
     // =============================================================
     // Core Boot Guard & Utilities
@@ -70,11 +144,6 @@
     }
 
     /**
-     * Chat UI Module: lightweight chat overlay with history + input
-     * - Reads history from ChatModule
-     * - Sends via WebSocketModule.sendChatMessage
-     */
-    /**
      * ChatUIModule
      * Lightweight chat overlay that mirrors in-game chat history
      * and provides a focused text input to send messages.
@@ -82,6 +151,10 @@
      * Data sources/sinks:
      * - Reads history from `ChatModule.getHistory()`
      * - Sends via `WebSocketModule.sendChatMessage()`
+     *
+     * Usage
+     * - Created and mounted by NovaClient when the game becomes available.
+     * - Press Enter to focus and type; Escape to unfocus.
      */
     class ChatUIModule {
         constructor(gameModule) {
@@ -129,7 +202,7 @@
                         height: 450px;
                         overflow-y: auto;
                         overflow-x: hidden;
-                        scrollbar-width: thin;
+                        scrollbar-width: none;
                         border: none;
                         font-size: 12px;
                         line-height: 1.3;
@@ -166,13 +239,15 @@
                 this.container.className = 'nova-chatui';
                 this.container.innerHTML = `
                     <div class="nova-chatui-body">
-                        <div class="nova-chatui-list nova-scrollbar"></div>
+                        <div class="nova-chatui-list"></div>
                         <form class="nova-chatui-form">
                             <input class="nova-chatui-input" type="text" maxlength="200" placeholder="Type message…" />
                         </form>
                     </div>
                 `;
                 document.body.appendChild(this.container);
+                // Start hidden; will show only when a map is playing
+                this.container.style.display = 'none';
 
                 this.listEl = this.container.querySelector('.nova-chatui-list');
                 this.inputEl = this.container.querySelector('.nova-chatui-input');
@@ -208,8 +283,6 @@
                         text = `<color=white>${WebSocketModule.localPlayer.rawName}</color>: <color=#e8e8e8>${text}`;
                         try { WebSocketModule.sendChatMessage(text); } catch (_e2) {}
                         this.inputEl.value = '';
-                        // Optimistically append
-                        this._appendOwn(text);
                         this.inputEl.blur();
                     } catch (_e) { /* ignore */ }
                 });
@@ -243,6 +316,12 @@
         update() {
             try {
                 if (!this.listEl) return;
+                const playing = !!(this.game && this.game.isMapPlaying);
+                this._setVisible(playing);
+                if (!playing) {
+                    this.listEl.innerHTML = '';
+                    return;
+                }
                 const history = (ChatModule && typeof ChatModule.getHistory === 'function') ? ChatModule.getHistory() : [];
                 if (!Array.isArray(history)) return;
                 if (history.length === this._lastLen) return;
@@ -254,16 +333,12 @@
             } catch (_e) { /* ignore */ }
         }
 
-        /** Optimistically append a locally-sent message. */
-        _appendOwn(text) {
-            try {
-                if (!this.listEl) return;
-                const el = document.createElement('div');
-                el.className = 'nova-chatui-item';
-                el.innerHTML = this._colorizeText(text);
-                this.listEl.appendChild(el);
-                this.listEl.scrollTop = this.listEl.scrollHeight + 1000;
-            } catch (_e) { /* ignore */ }
+        /** Update display state without reflowing content. */
+        _setVisible(visible) {
+            if (!this.container) return;
+            if (this.visible === visible) return;
+            this.visible = visible;
+            this.container.style.display = visible ? 'block' : 'none';
         }
 
         /**
@@ -276,31 +351,40 @@
                     .replace(/&/g, '&amp;')
                     .replace(/</g, '&lt;')
                     .replace(/>/g, '&gt;');
-                // Support <color=#RGB>, <color=#RRGGBB>, <color=#RRGGBBAA>, and named colors like <color=yellow>
-                // Also allow missing closing tag: treat as colored until end of string
-                const regex = /<color=([^>]+)>([\s\S]*?)(?:<\/color>|$)/gi;
-                let out = '';
-                let lastIndex = 0;
-                let match;
-                while ((match = regex.exec(raw)) !== null) {
-                    const [full, colorSpecRaw, innerRaw] = match;
-                    const start = match.index;
-                    // Text before the tag
-                    out += escapeHtml(raw.slice(lastIndex, start));
-                    // Normalize color
+                const renderPlainWithSprites = (s) => {
+                    const input = String(s);
+                    let out = '';
+                    let i = 0;
+                    const re = /<sprite=(\d+)>/gi;
+                    let m;
+                    while ((m = re.exec(input)) !== null) {
+                        const start = m.index;
+                        const end = start + m[0].length;
+                        out += escapeHtml(input.slice(i, start));
+                        const id = parseInt(m[1], 10);
+                        let color = (NovaConfig && NovaConfig.theme && NovaConfig.theme.blue) || '#1da1f2';
+                        if (id === 1) color = (NovaConfig && NovaConfig.theme && NovaConfig.theme.yellow) || '#ffa500';
+                        if (id === 2) color = (NovaConfig && NovaConfig.theme && NovaConfig.theme.success) || '#00c853';
+                        out += `<span style="background: ${color}; border-radius: 4px; padding: 0 4px; color: ${NovaConfig.theme.background};"><strong>✔</strong></span> `;
+                        i = end;
+                    }
+                    out += escapeHtml(input.slice(i));
+                    return out;
+                };
+                const nameToHex = {
+                    red: 'ff0000', green: '00ff00', blue: '0000ff', yellow: 'ffff00', orange: 'ffa500',
+                    white: 'ffffff', black: '000000', purple: '800080', magenta: 'ff00ff', cyan: '00ffff',
+                    pink: 'ffc0cb', gray: '808080', grey: '808080'
+                };
+                const normalizeColor = (colorSpecRaw) => {
                     const colorSpec = String(colorSpecRaw || '').trim();
-                    const nameToHex = {
-                        red: 'ff0000', green: '00ff00', blue: '0000ff', yellow: 'ffff00', orange: 'ffa500',
-                        white: 'ffffff', black: '000000', purple: '800080', magenta: 'ff00ff', cyan: '00ffff',
-                        pink: 'ffc0cb', gray: '808080', grey: '808080'
-                    };
                     let cssColor = colorSpec;
                     let r = 255, g = 255, b = 255;
                     let hasRgb = false;
                     if (colorSpec.startsWith('#')) {
                         let h = colorSpec.slice(1);
                         if (h.length === 3) h = h.split('').map(c => c + c).join('');
-                        if (h.length === 8) h = h.slice(0, 6); // ignore alpha if present
+                        if (h.length === 8) h = h.slice(0, 6);
                         if (h.length === 6) {
                             cssColor = `#${h}`;
                             try { r = parseInt(h.slice(0, 2), 16); g = parseInt(h.slice(2, 4), 16); b = parseInt(h.slice(4, 6), 16); hasRgb = true; } catch (_e) {}
@@ -313,27 +397,98 @@
                             try { r = parseInt(h.slice(0, 2), 16); g = parseInt(h.slice(2, 4), 16); b = parseInt(h.slice(4, 6), 16); hasRgb = true; } catch (_e) {}
                         }
                     }
-                    // Decide background based on text brightness (dark text -> lighter bg)
-                    if (!hasRgb) { r = 255; g = 255; b = 255; } // assume light if unknown
-                    const brightness = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
-                    // If the colored segment is bracketed, drop brackets
-                    const bracket = innerRaw.match(/^\s*\[([^\]]{1,64})\]\s*$/);
-                    const innerNoBrackets = bracket ? bracket[1] : innerRaw;
-                    // Background rule: apply if dark text OR was bracketed; otherwise no background
-                    const isDark = brightness < 0.45;
-                    const useBg = isDark || !!bracket;
-                    let style = `color: ${cssColor};`;
-                    if (useBg) {
-                        const bg = isDark ? NovaConfig.theme.text : NovaConfig.theme.border;
-                        style += ` background: ${bg}; border-radius: 4px; padding: 0 4px;`;
+                    if (!hasRgb) { r = 255; g = 255; b = 255; }
+                    return { cssColor, r, g, b };
+                };
+                const renderFrom = (input, startIndex) => {
+                    let out = '';
+                    let i = startIndex || 0;
+                    const len = input.length;
+                    while (i < len) {
+                        const openIdx = input.indexOf('<color=', i);
+                        const closeIdx = input.indexOf('</color>', i);
+                        if (openIdx === -1 && closeIdx === -1) {
+                            out += renderPlainWithSprites(input.slice(i));
+                            i = len;
+                            break;
+                        }
+                        if (openIdx !== -1 && (closeIdx === -1 || openIdx < closeIdx)) {
+                            out += renderPlainWithSprites(input.slice(i, openIdx));
+                            const openMatch = /^<color=([^>]+)>/i.exec(input.slice(openIdx));
+                            if (!openMatch) {
+                                out += '&lt;';
+                                i = openIdx + 1;
+                                continue;
+                            }
+                            const colorSpecRaw = openMatch[1];
+                            const tagEnd = openIdx + openMatch[0].length;
+                            let depth = 1;
+                            let j = tagEnd;
+                            while (j < len && depth > 0) {
+                                const nextOpen = input.indexOf('<color=', j);
+                                const nextClose = input.indexOf('</color>', j);
+                                if (nextOpen !== -1 && (nextClose === -1 || nextOpen < nextClose)) {
+                                    const m2 = /^<color=([^>]+)>/i.exec(input.slice(nextOpen));
+                                    if (m2) { depth++; j = nextOpen + m2[0].length; continue; }
+                                    j = nextOpen + 1; continue;
+                                } else if (nextClose !== -1) {
+                                    depth--;
+                                    if (depth === 0) {
+                                        const innerStart = tagEnd;
+                                        const innerEnd = nextClose;
+                                        const innerRaw = input.slice(innerStart, innerEnd);
+                                        const { cssColor, r, g, b } = normalizeColor(colorSpecRaw);
+                                        const brightness = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+                                        const bracket = innerRaw.match(/^\s*\[([^\]]{1,64})\]\s*$/);
+                                        const isDark = brightness < 0.45;
+                                        const useBg = isDark || !!bracket;
+                                        let style = `color: ${cssColor};`;
+                                        if (useBg) {
+                                            const bg = isDark ? NovaConfig.theme.text : NovaConfig.theme.border;
+                                            style += ` background: ${bg}; border-radius: 4px; padding: 0 4px;`;
+                                        }
+                                        const innerHtml = bracket ? renderPlainWithSprites(bracket[1]) : renderFrom(innerRaw, 0);
+                                        let segment = `<span style="${style}"><strong>` + innerHtml + `</strong></span>`;
+                                        if (bracket) segment += ' ';
+                                        out += segment;
+                                        j = nextClose + '</color>'.length;
+                                        i = j;
+                                        break;
+                                    } else {
+                                        j = nextClose + '</color>'.length;
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                            if (depth > 0) {
+                                const innerRaw = input.slice(tagEnd);
+                                const { cssColor, r, g, b } = normalizeColor(colorSpecRaw);
+                                const brightness = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+                                const bracket = innerRaw.match(/^\s*\[([^\]]{1,64})\]\s*$/);
+                                const isDark = brightness < 0.45;
+                                const useBg = isDark || !!bracket;
+                                let style = `color: ${cssColor};`;
+                                if (useBg) {
+                                    const bg = isDark ? NovaConfig.theme.text : NovaConfig.theme.border;
+                                    style += ` background: ${bg}; border-radius: 4px; padding: 0 4px;`;
+                                }
+                                const innerHtml = bracket ? renderPlainWithSprites(bracket[1]) : renderFrom(innerRaw, 0);
+                                let segment = `<span style="${style}"><strong>` + innerHtml + `</strong></span>`;
+                                if (bracket) segment += ' ';
+                                out += segment;
+                                i = len;
+                            }
+                            continue;
+                        } else if (closeIdx !== -1 && (openIdx === -1 || closeIdx < openIdx)) {
+                            out += renderPlainWithSprites(input.slice(i, closeIdx));
+                            i = closeIdx + '</color>'.length;
+                            continue;
+                        }
                     }
-                    let segment = `<span style="${style}"><strong>` + escapeHtml(innerNoBrackets) + `</strong></span>`;
-                    if (bracket) segment += ' ';
-                    out += segment;
-                    lastIndex = regex.lastIndex;
-                }
-                out += escapeHtml(raw.slice(lastIndex));
-                return out;
+                    return out;
+                };
+                return renderFrom(String(raw || ''), 0);
             } catch (_e) {
                 return String(raw || '');
             }
@@ -358,6 +513,10 @@
     /**
      * Lightweight in-page notification manager (toast system).
      * Provides show/info/success/error APIs and auto-dismiss behavior.
+     */
+    /**
+     * NotificationManager: very small toast system used by NovaAPI.notify/info/success/error.
+     * Falls back to GM_notification if DOM container cannot be created.
      */
     class NotificationManager {
         constructor(config) {
@@ -386,9 +545,9 @@
 
         /**
          * Show a toast. Accepts a string message or an options object.
-         * @param {string|{message:string,type?:'info'|'success'|'error',durationMs?:number}} input
-         * @param {'info'|'success'|'error'} [type]
-         * @param {number} [durationMs]
+         * @param {string|ToastOptions} input Message or options
+         * @param {'info'|'success'|'error'} [type] Variant when `input` is string
+         * @param {number} [durationMs] Auto‑dismiss delay override
          */
         show(input, type, durationMs) {
             let message;
@@ -482,6 +641,12 @@
      * Prevents the page/game from suppressing keyboard input intended for
      * inputs inside the Nova Client UI. Installs capturing listeners and
      * safely overrides preventDefault for relevant events.
+     */
+    /**
+     * EventUnblocker: Allows keyboard/input events within Nova UI to bypass
+     * aggressive in‑page preventDefault/stopPropagation used by the game.
+     *
+     * Installed once during NovaClient.init(). Safe to call multiple times.
      */
     class EventUnblocker {
         static _installed = false;
@@ -590,6 +755,11 @@
      * - register(): add feature definitions
      * - setEnabled(): toggle at runtime and persist state
      * - activateEnabled(): apply persisted states after boot
+     */
+    /**
+     * FeatureRegistry: registers feature definitions, persists toggle state and
+     * arbitrary control values, enforces incompatibilities, and handles delayed
+     * activation retries for features that must wait on game state.
      */
     class FeatureRegistry {
         constructor() {
@@ -767,6 +937,13 @@
      * - Allows registering handlers bound to a featureId
      * - Handlers only run when the associated feature is enabled
      */
+    /**
+     * WebGLHooks: wraps a small set of WebGL methods (draw* and shaderSource)
+     * with a Proxy and dispatches to handlers registered per feature id. A
+     * handler runs only when its feature is currently enabled.
+     *
+     * Register with: `NovaAPI.webgl.register('my.feature', 'drawElements', (ctx) => { ... })`
+     */
     class WebGLHooks {
         static _installed = false;
         static _featureRegistry = null;
@@ -862,6 +1039,10 @@
      * Firebase helper for reading/writing under /users/${uid}
      * Assumes the page provides firebase (v8 namespaced SDK) in window.
      */
+    /**
+     * FirebaseModule: thin helpers around page‑injected Firebase SDK used by Kour.io.
+     * All methods are no‑ops if Firebase is not present. Used for username restore.
+     */
     class FirebaseModule {
         static isAvailable() {
             try {
@@ -907,6 +1088,10 @@
     /**
      * Unity helper to safely send messages to the embedded Unity instance.
      */
+    /**
+     * UnityModule: bridge to the page’s Unity instance. Provides send helpers
+     * and best‑effort retry wrappers for common calls used by Nova features.
+     */
     class UnityModule {
         static isAvailable() {
             try {
@@ -943,6 +1128,10 @@
      * ChatModule
      * Collects recent chat messages decoded from network traffic.
      * Exposes a simple history buffer consumed by ChatUIModule.
+     */
+    /**
+     * ChatModule: parses typed string payloads from server chat frames and
+     * keeps a short rolling history for ChatUIModule to render.
      */
     const ChatModule = {
         history: [],
@@ -1005,7 +1194,9 @@
                 if (!(u8.length >= 4 && u8[0] === 0xf3 && u8[1] === 0x04 && u8[2] === 0x00 && u8[3] === 0x02)) return;
                 const strings = this._extractTypedStrings(u8, 6);
                 if (strings && strings.length) {
-                    for (const s of strings) this._add(s);
+                    for (const s of strings) {
+                        this._add(s);
+                    };
                 }
             } catch (_e) {}
         }
@@ -1158,6 +1349,11 @@
     }
 
     // Base class for reading and writing binary data
+    /**
+     * BinaryStream: base for reading/writing the custom binary protocol used
+     * by Kour.io messages. High‑level helpers read/write typed primitives
+     * (strings, numbers, arrays, maps) with explicit marker bytes.
+     */
     class BinaryStream {
         buffer = null; // Uint8Array to hold the data
         position = 0; // Current read/write position
@@ -1973,6 +2169,7 @@
     // - Known message signatures used to pattern-match server/client packets
     // - Magic numbers and utility constants
     // =============================================================
+    /** Miscellaneous constants and magic numbers used across modules. */
     const GAME_CONSTANTS = {
         MAGIC_NUMBER_1: 0xcafe,
         MAGIC_NUMBER_2: 0xbabe,
@@ -1980,6 +2177,7 @@
     };
 
     /** Known server → client message signatures. */
+    /** Known server → client message signatures used to match payloads. */
     const SERVER_MESSAGE_SIGNATURES = {
         PLAYER_UPDATE: new Uint8Array([0xf3, 0x4, 0xc9, 0x2]),
         PLAYER_MOVE: new Uint8Array([0xf3, 0x4, 0xce, 0x2]),
@@ -2020,6 +2218,7 @@
     };
 
     /** Known client → server message signatures. */
+    /** Known client → server message signatures used to match payloads. */
     const CLIENT_MESSAGE_SIGNATURES = {
         PLAYER_ACTION_1: new Uint8Array([0xf3, 0x2, 0xfd, 0x2, 0xf4, 0x3, 0xc9]),
         PLAYER_ACTION_2: new Uint8Array([0xf3, 0x2, 0xfd, 0x2, 0xf4, 0x3, 0xce]),
@@ -2470,6 +2669,12 @@
         }
     }
 
+    /**
+     * WebSocketModule: intercepts the game WebSocket, parses known binary
+     * message signatures, tracks Player entities and room state, and relays
+     * chat frames to ChatModule. Exposes convenient helpers like
+     * sendChatMessage and flags like isMapPlaying for UI modules.
+     */
     const WebSocketModule = {
         currentUser: null,
         isGameWebSocketActive: false,
@@ -4153,6 +4358,10 @@
     // =============================================================
     // Nova Client Configuration
     // =============================================================
+    /**
+     * NovaConfig: user‑tweakable theme, fonts and hotkeys. Changing values
+     * here adjusts the look and defaults without touching logic.
+     */
     const NovaConfig = {
         version: '1.0.0',
         name: 'Nova Client',
@@ -4344,31 +4553,40 @@
                     .replace(/&/g, '&amp;')
                     .replace(/</g, '&lt;')
                     .replace(/>/g, '&gt;');
-                // Support <color=#RGB>, <color=#RRGGBB>, <color=#RRGGBBAA>, and named colors like <color=yellow>
-                // Also allow missing closing tag: treat as colored until end of string
-                const regex = /<color=([^>]+)>([\s\S]*?)(?:<\/color>|$)/gi;
-                let out = '';
-                let lastIndex = 0;
-                let match;
-                while ((match = regex.exec(raw)) !== null) {
-                    const [full, colorSpecRaw, innerRaw] = match;
-                    const start = match.index;
-                    // Text before the tag
-                    out += escapeHtml(raw.slice(lastIndex, start));
-                    // Normalize color
+                const renderPlainWithSprites = (s) => {
+                    const input = String(s);
+                    let out = '';
+                    let i = 0;
+                    const re = /<sprite=(\d+)>/gi;
+                    let m;
+                    while ((m = re.exec(input)) !== null) {
+                        const start = m.index;
+                        const end = start + m[0].length;
+                        out += escapeHtml(input.slice(i, start));
+                        const id = parseInt(m[1], 10);
+                        let color = (NovaConfig && NovaConfig.theme && NovaConfig.theme.blue) || '#1da1f2';
+                        if (id === 1) color = (NovaConfig && NovaConfig.theme && NovaConfig.theme.yellow) || '#ffa500';
+                        if (id === 2) color = (NovaConfig && NovaConfig.theme && NovaConfig.theme.success) || '#00c853';
+                        out += `<span style="background: ${color}; border-radius: 4px; padding: 0 4px; color: ${NovaConfig.theme.background};"><strong>✔</strong></span> `;
+                        i = end;
+                    }
+                    out += escapeHtml(input.slice(i));
+                    return out;
+                };
+                const nameToHex = {
+                    red: 'ff0000', green: '00ff00', blue: '0000ff', yellow: 'ffff00', orange: 'ffa500',
+                    white: 'ffffff', black: '000000', purple: '800080', magenta: 'ff00ff', cyan: '00ffff',
+                    pink: 'ffc0cb', gray: '808080', grey: '808080'
+                };
+                const normalizeColor = (colorSpecRaw) => {
                     const colorSpec = String(colorSpecRaw || '').trim();
-                    const nameToHex = {
-                        red: 'ff0000', green: '00ff00', blue: '0000ff', yellow: 'ffff00', orange: 'ffa500',
-                        white: 'ffffff', black: '000000', purple: '800080', magenta: 'ff00ff', cyan: '00ffff',
-                        pink: 'ffc0cb', gray: '808080', grey: '808080'
-                    };
                     let cssColor = colorSpec;
                     let r = 255, g = 255, b = 255;
                     let hasRgb = false;
                     if (colorSpec.startsWith('#')) {
                         let h = colorSpec.slice(1);
                         if (h.length === 3) h = h.split('').map(c => c + c).join('');
-                        if (h.length === 8) h = h.slice(0, 6); // ignore alpha if present
+                        if (h.length === 8) h = h.slice(0, 6);
                         if (h.length === 6) {
                             cssColor = `#${h}`;
                             try { r = parseInt(h.slice(0, 2), 16); g = parseInt(h.slice(2, 4), 16); b = parseInt(h.slice(4, 6), 16); hasRgb = true; } catch (_e) {}
@@ -4381,27 +4599,98 @@
                             try { r = parseInt(h.slice(0, 2), 16); g = parseInt(h.slice(2, 4), 16); b = parseInt(h.slice(4, 6), 16); hasRgb = true; } catch (_e) {}
                         }
                     }
-                    // Decide background based on text brightness (dark text -> lighter bg)
-                    if (!hasRgb) { r = 255; g = 255; b = 255; } // assume light if unknown
-                    const brightness = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
-                    // If the colored segment is bracketed, drop brackets
-                    const bracket = innerRaw.match(/^\s*\[([^\]]{1,64})\]\s*$/);
-                    const innerNoBrackets = bracket ? bracket[1] : innerRaw;
-                    // Background rule: apply if dark text OR was bracketed; otherwise no background
-                    const isDark = brightness < 0.45;
-                    const useBg = isDark || !!bracket;
-                    let style = `color: ${cssColor};`;
-                    if (useBg) {
-                        const bg = isDark ? NovaConfig.theme.text : NovaConfig.theme.border;
-                        style += ` background: ${bg}; border-radius: 4px; padding: 0 4px;`;
+                    if (!hasRgb) { r = 255; g = 255; b = 255; }
+                    return { cssColor, r, g, b };
+                };
+                const renderFrom = (input, startIndex) => {
+                    let out = '';
+                    let i = startIndex || 0;
+                    const len = input.length;
+                    while (i < len) {
+                        const openIdx = input.indexOf('<color=', i);
+                        const closeIdx = input.indexOf('</color>', i);
+                        if (openIdx === -1 && closeIdx === -1) {
+                            out += renderPlainWithSprites(input.slice(i));
+                            i = len;
+                            break;
+                        }
+                        if (openIdx !== -1 && (closeIdx === -1 || openIdx < closeIdx)) {
+                            out += renderPlainWithSprites(input.slice(i, openIdx));
+                            const openMatch = /^<color=([^>]+)>/i.exec(input.slice(openIdx));
+                            if (!openMatch) {
+                                out += '&lt;';
+                                i = openIdx + 1;
+                                continue;
+                            }
+                            const colorSpecRaw = openMatch[1];
+                            const tagEnd = openIdx + openMatch[0].length;
+                            let depth = 1;
+                            let j = tagEnd;
+                            while (j < len && depth > 0) {
+                                const nextOpen = input.indexOf('<color=', j);
+                                const nextClose = input.indexOf('</color>', j);
+                                if (nextOpen !== -1 && (nextClose === -1 || nextOpen < nextClose)) {
+                                    const m2 = /^<color=([^>]+)>/i.exec(input.slice(nextOpen));
+                                    if (m2) { depth++; j = nextOpen + m2[0].length; continue; }
+                                    j = nextOpen + 1; continue;
+                                } else if (nextClose !== -1) {
+                                    depth--;
+                                    if (depth === 0) {
+                                        const innerStart = tagEnd;
+                                        const innerEnd = nextClose;
+                                        const innerRaw = input.slice(innerStart, innerEnd);
+                                        const { cssColor, r, g, b } = normalizeColor(colorSpecRaw);
+                                        const brightness = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+                                        const bracket = innerRaw.match(/^\s*\[([^\]]{1,64})\]\s*$/);
+                                        const isDark = brightness < 0.45;
+                                        const useBg = isDark || !!bracket;
+                                        let style = `color: ${cssColor};`;
+                                        if (useBg) {
+                                            const bg = isDark ? NovaConfig.theme.text : NovaConfig.theme.border;
+                                            style += ` background: ${bg}; border-radius: 4px; padding: 0 4px;`;
+                                        }
+                                        const innerHtml = bracket ? renderPlainWithSprites(bracket[1]) : renderFrom(innerRaw, 0);
+                                        let segment = `<span style="${style}"><strong>` + innerHtml + `</strong></span>`;
+                                        if (bracket) segment += ' ';
+                                        out += segment;
+                                        j = nextClose + '</color>'.length;
+                                        i = j;
+                                        break;
+                                    } else {
+                                        j = nextClose + '</color>'.length;
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                            if (depth > 0) {
+                                const innerRaw = input.slice(tagEnd);
+                                const { cssColor, r, g, b } = normalizeColor(colorSpecRaw);
+                                const brightness = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+                                const bracket = innerRaw.match(/^\s*\[([^\]]{1,64})\]\s*$/);
+                                const isDark = brightness < 0.45;
+                                const useBg = isDark || !!bracket;
+                                let style = `color: ${cssColor};`;
+                                if (useBg) {
+                                    const bg = isDark ? NovaConfig.theme.text : NovaConfig.theme.border;
+                                    style += ` background: ${bg}; border-radius: 4px; padding: 0 4px;`;
+                                }
+                                const innerHtml = bracket ? renderPlainWithSprites(bracket[1]) : renderFrom(innerRaw, 0);
+                                let segment = `<span style="${style}"><strong>` + innerHtml + `</strong></span>`;
+                                if (bracket) segment += ' ';
+                                out += segment;
+                                i = len;
+                            }
+                            continue;
+                        } else if (closeIdx !== -1 && (openIdx === -1 || closeIdx < openIdx)) {
+                            out += renderPlainWithSprites(input.slice(i, closeIdx));
+                            i = closeIdx + '</color>'.length;
+                            continue;
+                        }
                     }
-                    let segment = `<span style="${style}"><strong>` + escapeHtml(innerNoBrackets) + `</strong></span>`;
-                    if (bracket) segment += ' ';
-                    out += segment;
-                    lastIndex = regex.lastIndex;
-                }
-                out += escapeHtml(raw.slice(lastIndex));
-                return out;
+                    return out;
+                };
+                return renderFrom(String(raw || ''), 0);
             } catch (_e) {
                 return String(raw || '');
             }
@@ -4449,6 +4738,7 @@
             this._cycleClassesIdx = 0;
             
             // Expose a small public API for feature management
+            /** @type {NovaAPI} */
             window.NovaAPI = {
                 registerFeature: (def) => {
                     this.features.register(def);
@@ -4662,7 +4952,9 @@
     }
 
     /**
-     * Nova UI: renders the panel, manages tabs and drag/position persistence.
+     * NovaUI: renders the control panel (tabs, feature list, settings),
+     * manages drag/position persistence, and exposes small fun utilities
+     * used by built-in features (e.g., spawnChickens).
      * Keep all DOM/UI-specific logic here.
      */
     class NovaUI {
